@@ -11,12 +11,14 @@ import (
 )
 
 const (
-	SERVER_ADDR = "192.168.1.227:9000"
-	CHUNK_SIZE  = 4096
-	TIMEOUT     = 5 * time.Second
+	SERVER_ADDR   = "192.168.1.227:9000"
+	CHUNK_SIZE    = 4096
+	RETRY_TIMEOUT = 2 * time.Second
+	MAX_RETRIES   = 3
 )
 
 var conn *net.UDPConn
+var sequence = 0
 
 func main() {
 	if len(os.Args) < 2 {
@@ -44,49 +46,53 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Declare err variable to hold result of send functions
-	var sendErr error
+	var transferErr error
 	if fileInfo.IsDir() {
-		sendErr = sendDirectory(path)
+		transferErr = sendDirectory(path)
 	} else {
-		sendErr = sendFile(path, filepath.Base(path))
+		transferErr = sendFile(path, filepath.Base(path))
 	}
 
-	if sendErr != nil {
-		fmt.Printf("An error occurred: %v\n", sendErr)
+	if transferErr != nil {
+		fmt.Printf("An error occurred: %v\n", transferErr)
 		os.Exit(1)
 	}
 
 	fmt.Println("Operation completed successfully.")
 }
 
-// sendCommand sends a command and waits for a specific ACK
-func sendCommand(cmd string) error {
-	_, err := conn.Write([]byte(cmd))
-	if err != nil {
-		return fmt.Errorf("error sending command '%s': %w", cmd, err)
-	}
+func sendReliably(cmd, payload string) error {
+	sequence++
+	localSeq := sequence
+	packet := fmt.Sprintf("%d:%s:%s", localSeq, cmd, payload)
 
-	ackBuffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(TIMEOUT))
-	n, err := conn.Read(ackBuffer)
-	if err != nil {
-		return fmt.Errorf("error receiving ACK for command '%s': %w", cmd, err)
-	}
+	for i := 0; i < MAX_RETRIES; i++ {
+		_, err := conn.Write([]byte(packet))
+		if err != nil {
+			return fmt.Errorf("error sending packet: %w", err)
+		}
 
-	ackMsg := string(ackBuffer[:n])
-	cmdParts := strings.Split(cmd, ":")
-	expectedAck := "ACK:" + cmdParts[0]
-	if ackMsg != expectedAck {
-		return fmt.Errorf("received invalid ACK for command '%s': got '%s', expected '%s'", cmd, ackMsg, expectedAck)
+		ackBuffer := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(RETRY_TIMEOUT))
+		n, err := conn.Read(ackBuffer)
+		if err != nil {
+			fmt.Printf("Attempt %d: No ACK for seq %d, retrying...\n", i+1, localSeq)
+			continue // Timeout, retry
+		}
+
+		ackMsg := string(ackBuffer[:n])
+		expectedAck := fmt.Sprintf("%d:ACK:%s", localSeq, cmd)
+		if ackMsg == expectedAck {
+			return nil // Success
+		}
 	}
-	return nil
+	return fmt.Errorf("failed to get ACK for seq %d after %d retries", localSeq, MAX_RETRIES)
 }
 
-// sendFile handles the logic for transferring a single file with chunk acknowledgments
 func sendFile(filePath string, destPath string) error {
 	fmt.Printf("Sending file: %s\n", destPath)
-	if err := sendCommand(fmt.Sprintf("FILE_START:%s", destPath)); err != nil {
+
+	if err := sendReliably("FILE_START", destPath); err != nil {
 		return err
 	}
 
@@ -99,60 +105,30 @@ func sendFile(filePath string, destPath string) error {
 	chunkBuffer := make([]byte, CHUNK_SIZE)
 	for {
 		n, err := file.Read(chunkBuffer)
-		if err != nil {
-			if err == io.EOF {
-				break // End of file
-			}
+		if err != nil && err != io.EOF {
 			return fmt.Errorf("error reading chunk from file: %w", err)
 		}
 		if n == 0 {
 			break
 		}
 
-		if err := sendCommandWithData("CHUNK", chunkBuffer[:n]); err != nil {
+		if err := sendReliably("CHUNK", string(chunkBuffer[:n])); err != nil {
 			return fmt.Errorf("error sending chunk: %w", err)
 		}
 	}
 
-	if err := sendCommand("FILE_END"); err != nil {
-		return err
-	}
-	fmt.Printf("Finished sending file: %s\n", destPath)
-	return nil
+	return sendReliably("FILE_END", "")
 }
 
-// sendCommandWithData sends data and waits for a generic data ACK
-func sendCommandWithData(cmd string, data []byte) error {
-	_, err := conn.Write(data)
-	if err != nil {
-		return fmt.Errorf("error sending data for command '%s': %w", cmd, err)
-	}
-
-	ackBuffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(TIMEOUT))
-	n, err := conn.Read(ackBuffer)
-	if err != nil {
-		return fmt.Errorf("error receiving ACK for data command '%s': %w", cmd, err)
-	}
-
-	ackMsg := string(ackBuffer[:n])
-	expectedAck := "ACK:" + cmd
-	if ackMsg != expectedAck {
-		return fmt.Errorf("received invalid ACK for data command '%s': got '%s'", cmd, ackMsg)
-	}
-	return nil
-}
-
-// sendDirectory walks a directory and sends the structure and files to the server
 func sendDirectory(source string) error {
 	baseDir := filepath.Base(source)
 	fmt.Printf("Starting directory transfer: %s\n", baseDir)
 
-	if err := sendCommand(fmt.Sprintf("DIR_TRANSFER_START:%s", baseDir)); err != nil {
+	if err := sendReliably("DIR_TRANSFER_START", baseDir); err != nil {
 		return err
 	}
 
-	err = filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -161,13 +137,13 @@ func sendDirectory(source string) error {
 		if err != nil {
 			return err
 		}
+
 		if relPath == "." {
 			return nil
 		}
 
 		if info.IsDir() {
-			fmt.Printf("Creating directory: %s\n", relPath)
-			return sendCommand(fmt.Sprintf("MKDIR:%s", relPath))
+			return sendReliably("MKDIR", relPath)
 		} else {
 			return sendFile(path, relPath)
 		}
@@ -177,10 +153,5 @@ func sendDirectory(source string) error {
 		return fmt.Errorf("error walking directory: %w", err)
 	}
 
-	if err := sendCommand("DIR_TRANSFER_END"); err != nil {
-		return err
-	}
-
-	fmt.Println("Finished directory transfer.")
-	return nil
+	return sendReliably("DIR_TRANSFER_END", "")
 }

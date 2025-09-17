@@ -6,19 +6,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
 	PORT        = ":9000"
-	BUFFER_SIZE = 8192 // Use a larger buffer for efficiency
+	BUFFER_SIZE = 8192
+	TIMEOUT     = 10 * time.Second // Timeout for a session with no activity
 )
 
-var KNOWN_COMMANDS = map[string]bool{
-	"DIR_TRANSFER_START": true,
-	"MKDIR":              true,
-	"FILE_START":         true,
-	"FILE_END":           true,
-	"DIR_TRANSFER_END":   true,
+// Session holds the state for a single client connection
+type Session struct {
+	lastSequence  int
+	currentDir    string
+	currentFile   *os.File
+	lastPacket    time.Time
+	packetChannel chan []byte
+	rootDir       string // The top-level directory for this transfer
+}
+
+// sessionManager safely manages active sessions
+var sessionManager = struct {
+	sync.RWMutex
+	sessions map[string]*Session
+}{
+	sessions: make(map[string]*Session),
 }
 
 func main() {
@@ -37,6 +50,7 @@ func main() {
 
 	fmt.Printf("Server listening on %s\n", addr.String())
 
+	// Packet dispatcher loop
 	for {
 		buffer := make([]byte, BUFFER_SIZE)
 		n, remoteAddr, err := conn.ReadFromUDP(buffer)
@@ -44,133 +58,126 @@ func main() {
 			fmt.Printf("Error reading from UDP: %v\n", err)
 			continue
 		}
-		// Handle each new client session sequentially
-		handleConnection(conn, remoteAddr, buffer[:n])
-	}
-}
 
-func handleConnection(conn *net.UDPConn, remoteAddr *net.UDPAddr, initialData []byte) {
-	fmt.Printf("\nNew connection from %s\n", remoteAddr.String())
+		addrStr := remoteAddr.String()
+		sessionManager.RLock()
+		session, found := sessionManager.sessions[addrStr]
+		sessionManager.RUnlock()
 
-	var currentDir string
-	var currentFile *os.File
-
-
-	defer func() {
-		if currentFile != nil {
-			currentFile.Close()
-		}
-	}()
-
-	// Process the first command
-	processData(initialData, conn, remoteAddr, &currentDir, &currentFile)
-
-	// Main loop for receiving subsequent commands and data
-	for {
-		buffer := make([]byte, BUFFER_SIZE)
-		n, _, err := conn.ReadFromUDP(buffer) // Expect data from the same client
-		if err != nil {
-			// This could be a client-side timeout, which is normal. The loop will just break.
-			fmt.Printf("Finished session with %s or timed out: %v\n", remoteAddr.String(), err)
-			return
-		}
-
-		finished := processData(buffer[:n], conn, remoteAddr, &currentDir, &currentFile)
-		if finished {
-			return // End of transfer
-		}
-	}
-}
-
-// processData parses and acts on incoming data, returning true if the session is finished
-func processData(data []byte, conn *net.UDPConn, remoteAddr *net.UDPAddr, currentDir *string, currentFile **os.File) bool {
-	cmd, payload := parseCommand(string(data))
-	var err error
-
-	if KNOWN_COMMANDS[cmd] {
-		switch cmd {
-		case "DIR_TRANSFER_START":
-			*currentDir = sanitizePath(payload)
-			fmt.Printf("Starting directory transfer: '%s'\n", *currentDir)
-			if err = os.MkdirAll(*currentDir, 0755); err != nil {
-				fmt.Printf("Error creating directory '%s': %v\n", *currentDir, err)
-			} else {
-				sendAck(conn, remoteAddr, "DIR_TRANSFER_START")
-			}
-		case "MKDIR":
-			dirPath := filepath.Join(*currentDir, sanitizePath(payload))
-			fmt.Printf("Creating directory: '%s'\n", dirPath)
-			if err = os.MkdirAll(dirPath, 0755); err != nil {
-				fmt.Printf("Error creating directory '%s': %v\n", dirPath, err)
-			} else {
-				sendAck(conn, remoteAddr, "MKDIR")
-			}
-		case "FILE_START":
-			if *currentFile != nil {
-				(*currentFile).Close()
-			}
-			if *currentDir == "" { // Handle standalone file case
-				*currentDir = "."
-			}
-			filePath := filepath.Join(*currentDir, sanitizePath(payload))
-			fmt.Printf("Receiving file: '%s'\n", filePath)
-			*currentFile, err = os.Create(filePath)
-			if err != nil {
-				fmt.Printf("Error creating file '%s': %v\n", filePath, err)
-			} else {
-				sendAck(conn, remoteAddr, "FILE_START")
-			}
-		case "FILE_END":
-			if *currentFile != nil {
-				fmt.Printf("Finished receiving file: '%s'\n", (*currentFile).Name())
-				(*currentFile).Close()
-				*currentFile = nil
-			}
-			sendAck(conn, remoteAddr, "FILE_END")
-		case "DIR_TRANSFER_END":
-			fmt.Printf("Finished directory transfer for '%s'\n", *currentDir)
-			sendAck(conn, remoteAddr, "DIR_TRANSFER_END")
-			return true // Signal to end the session
-		}
-	} else {
-		// Not a known command, so it must be file data (a chunk)
-		if *currentFile != nil {
-			if _, err := (*currentFile).Write(data); err != nil {
-				fmt.Printf("Error writing to file '%s': %v\n", (*currentFile).Name(), err)
-			} else {
-				// Acknowledge the chunk
-				sendAck(conn, remoteAddr, "CHUNK")
+		if found {
+			// Non-blocking send to avoid holding up the dispatcher
+			select {
+			case session.packetChannel <- buffer[:n]:
+			default:
+				fmt.Printf("Session channel full for %s. Dropping packet.\n", addrStr)
 			}
 		} else {
-			fmt.Println("Received file data without an open file")
+			// New session
+			fmt.Printf("New connection from %s\n", addrStr)
+			newSession := &Session{
+				packetChannel: make(chan []byte, 100), // Buffered channel
+				lastPacket:    time.Now(),
+			}
+
+			sessionManager.Lock()
+			sessionManager.sessions[addrStr] = newSession
+			sessionManager.Unlock()
+
+			go handleSession(conn, remoteAddr, newSession)
+			newSession.packetChannel <- buffer[:n]
 		}
 	}
-	return false // Session not finished
 }
 
-func parseCommand(data string) (string, string) {
-	parts := strings.SplitN(data, ":", 2)
-	// Check if the first part is a known command
-	if len(parts) > 0 && KNOWN_COMMANDS[parts[0]] {
-		if len(parts) == 2 {
-			return parts[0], parts[1]
+func handleSession(conn *net.UDPConn, remoteAddr *net.UDPAddr, s *Session) {
+	addrStr := remoteAddr.String()
+	defer func() {
+		sessionManager.Lock()
+		delete(sessionManager.sessions, addrStr)
+		sessionManager.Unlock()
+		if s.currentFile != nil {
+			s.currentFile.Close()
 		}
-		return parts[0], ""
+		fmt.Printf("Session closed for %s\n", addrStr)
+	}()
+
+	for {
+		select {
+		case packet := <-s.packetChannel:
+			s.lastPacket = time.Now()
+			parts := strings.SplitN(string(packet), ":", 3)
+			if len(parts) < 2 {
+				fmt.Printf("Invalid packet from %s: %s\n", addrStr, string(packet))
+				continue
+			}
+
+			seq, cmd, payload := parts[0], parts[1], ""
+			if len(parts) > 2 {
+				payload = parts[2]
+			}
+
+			// Simple ACK for now, no sequence handling yet
+			sendAck(conn, remoteAddr, seq, cmd)
+
+			switch cmd {
+			case "DIR_TRANSFER_START":
+				s.rootDir = sanitize(payload)
+				wd, _ := os.Getwd()
+				s.rootDir = filepath.Join(wd, s.rootDir)
+				os.MkdirAll(s.rootDir, 0755)
+			case "MKDIR":
+				dirPath := safeJoin(s.rootDir, payload)
+				os.MkdirAll(dirPath, 0755)
+			case "FILE_START":
+				if s.currentFile != nil {
+					s.currentFile.Close()
+				}
+				filePath := safeJoin(s.rootDir, payload)
+				var err error
+				s.currentFile, err = os.Create(filePath)
+				if err != nil {
+					fmt.Printf("Error creating file '%s': %v\n", filePath, err)
+				}
+			case "CHUNK":
+				if s.currentFile != nil {
+					s.currentFile.Write([]byte(payload))
+				}
+			case "FILE_END":
+				if s.currentFile != nil {
+					s.currentFile.Close()
+					s.currentFile = nil
+				}
+			case "DIR_TRANSFER_END":
+				return // End of session
+			}
+
+		case <-time.After(TIMEOUT):
+			fmt.Printf("Session timeout for %s\n", addrStr)
+			return
+		}
 	}
-	// If not a known command, treat the whole thing as data (or an unknown command)
-	return "", data
 }
 
-func sendAck(conn *net.UDPConn, remoteAddr *net.UDPAddr, forCmd string) {
-	ackMsg := "ACK:" + forCmd
+func sendAck(conn *net.UDPConn, remoteAddr *net.UDPAddr, seq, forCmd string) {
+	ackMsg := fmt.Sprintf("%s:ACK:%s", seq, forCmd)
 	_, err := conn.WriteToUDP([]byte(ackMsg), remoteAddr)
 	if err != nil {
-		fmt.Printf("Error sending ACK for '%s': %v\n", forCmd, err)
+		fmt.Printf("Error sending ACK for seq %s: %v\n", seq, err)
 	}
 }
 
-// sanitizePath prevents directory traversal attacks by only using the final component of a path.
-func sanitizePath(path string) string {
-	// Clean the path to resolve any '..' and then get the final, safe component.
-	return filepath.Base(filepath.Clean(path))
+// sanitize prevents path components from being weird (e.g. `..`)
+func sanitize(path string) string {
+	return filepath.Base(path)
+}
+
+// safeJoin joins a root directory and a relative path, ensuring the result is within the root.
+func safeJoin(root, relPath string) string {
+	relPath = sanitize(relPath)
+	joined := filepath.Join(root, relPath)
+	if strings.HasPrefix(joined, root) {
+		return joined
+	}
+	// If it tries to escape, just put it in the root.
+	return filepath.Join(root, filepath.Base(relPath))
 }
