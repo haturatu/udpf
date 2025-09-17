@@ -37,7 +37,7 @@ func main() {
 			continue
 		}
 
-		go handleConnection(conn, remoteAddr, buffer[:n])
+		handleConnection(conn, remoteAddr, buffer[:n])
 	}
 }
 
