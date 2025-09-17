@@ -23,11 +23,11 @@ const (
 	ACK            byte = 0xAA
 
 	// Sizes & Config
-	CHUNK_SIZE      = 1400 // MTU-safe chunk size
-	HEADER_SIZE     = 5
-	WINDOW_SIZE     = 128 // Number of packets to have in-flight
-	RETRY_TIMEOUT   = 2 * time.Second
-	MAX_FINAL_TRIES = 5
+	CHUNK_SIZE    = 1400
+	HEADER_SIZE   = 5
+	WINDOW_SIZE   = 128
+	RETRY_TIMEOUT = 1 * time.Second
+	FINAL_TIMEOUT = 5 * time.Second
 )
 
 // --- Sliding Window State ---
@@ -41,13 +41,11 @@ var window = struct {
 	base        uint32
 	nextSeqNum  uint32
 	sentPackets map[uint32]inflightPacket
-	ackChannel  chan uint32
 	done        chan struct{}
 }{
 	base:        1,
 	nextSeqNum:  1,
 	sentPackets: make(map[uint32]inflightPacket),
-	ackChannel:  make(chan uint32, WINDOW_SIZE),
 	done:        make(chan struct{}),
 }
 
@@ -73,7 +71,6 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Start the goroutines for managing the sliding window
 	go ackReceiver()
 	go retransmitter()
 
@@ -90,9 +87,11 @@ func main() {
 		transferErr = sendFile(path, filepath.Base(path))
 	}
 
-	// Wait for the last few ACKs to come in
-	waitForAcks(MAX_FINAL_TRIES)
-	close(window.done) // Signal background goroutines to exit
+	if transferErr == nil {
+		transferErr = waitForAcks()
+	}
+
+	close(window.done)
 
 	if transferErr != nil {
 		fmt.Printf("An error occurred: %v\n", transferErr)
@@ -102,7 +101,6 @@ func main() {
 	fmt.Println("Operation completed successfully.")
 }
 
-// ackReceiver runs in the background, processing incoming ACKs
 func ackReceiver() {
 	for {
 		select {
@@ -110,31 +108,35 @@ func ackReceiver() {
 			return
 		default:
 			ackBuffer := make([]byte, 1024)
-			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 			n, err := conn.Read(ackBuffer)
 			if err != nil {
-				continue // Likely a timeout, which is fine
+				continue
 			}
 			if n == HEADER_SIZE && ackBuffer[4] == ACK {
 				ackSeq := binary.BigEndian.Uint32(ackBuffer[0:4])
-				window.ackChannel <- ackSeq
+				window.Lock()
+				if ackSeq >= window.base {
+					for i := window.base; i <= ackSeq; i++ {
+						delete(window.sentPackets, i)
+					}
+					window.base = ackSeq + 1
+				}
+				window.Unlock()
 			}
 		}
 	}
 }
 
-// retransmitter runs in the background, re-sending timed-out packets
 func retransmitter() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-window.done:
 			return
 		case <-ticker.C:
 			window.Lock()
-			// Go-Back-N: If the base packet has timed out, re-send the whole window
 			if p, ok := window.sentPackets[window.base]; ok && time.Since(p.sendTime) > RETRY_TIMEOUT {
 				fmt.Printf("Timeout on base packet %d, re-sending window.\n", window.base)
 				for i := window.base; i < window.nextSeqNum; i++ {
@@ -150,9 +152,7 @@ func retransmitter() {
 	}
 }
 
-// sendReliably creates and sends a packet, managing the sliding window.
 func sendReliably(cmd byte, payload []byte) error {
-	// Block until the window has space
 	for {
 		window.Lock()
 		isFull := window.nextSeqNum >= window.base+WINDOW_SIZE
@@ -179,29 +179,7 @@ func sendReliably(cmd byte, payload []byte) error {
 
 	window.sentPackets[seq] = inflightPacket{sendTime: time.Now(), packet: packet}
 	window.nextSeqNum++
-
-	// Process any ACKs that have come in
-	processAcks()
 	return nil
-}
-
-// processAcks updates the window based on received ACKs.
-func processAcks() {
-	for {
-		select {
-		case ackSeq := <-window.ackChannel:
-			// If this ACK allows us to slide the window
-			if ackSeq >= window.base {
-				// Remove all acknowledged packets
-				for i := window.base; i <= ackSeq; i++ {
-					delete(window.sentPackets, i)
-				}
-			window.base = ackSeq + 1
-			}
-		default:
-			return
-		}
-	}
 }
 
 func sendFile(filePath string, destPath string) error {
@@ -262,22 +240,29 @@ func sendDirectory(source string) error {
 	return sendReliably(CMD_DIR_END, nil)
 }
 
-// waitForAcks gives a grace period for the last ACKs to arrive.
-func waitForAcks(retries int) {
-	for i := 0; i < retries; i++ {
+func waitForAcks() error {
+	fmt.Println("Waiting for final acknowledgments...")
+	timeout := time.After(FINAL_TIMEOUT)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
 		window.Lock()
-		remaining := len(window.sentPackets)
-		base := window.base
-		next := window.nextSeqNum
+		remaining := window.nextSeqNum - window.base
 		window.Unlock()
 
-		if remaining == 0 && base >= next {
+		if remaining == 0 {
 			fmt.Println("All packets acknowledged.")
-			return
+			return nil
 		}
-		fmt.Printf("Waiting for last %d ACKs...\n", remaining)
-		processAcks()
-		time.Sleep(RETRY_TIMEOUT)
+
+		select {
+		case <-timeout:
+			return fmt.Errorf("failed to receive final %d ACKs after timeout", remaining)
+		case <-ticker.C:
+			fmt.Printf("Waiting for final %d ACKs...\n", remaining)
+		case <-window.done:
+			return nil
+		}
 	}
-	fmt.Println("Finished waiting for ACKs.")
 }
