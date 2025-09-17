@@ -11,7 +11,7 @@ import (
 
 const (
 	SERVER_ADDR = "192.168.1.227:9000"
-	CHUNK_SIZE  = 4096
+	CHUNK_SIZE  = 4096 // Using a smaller chunk size for more reliable transmission
 	TIMEOUT     = 5 * time.Second
 )
 
@@ -57,6 +57,7 @@ func main() {
 	fmt.Println("Operation completed successfully.")
 }
 
+// sendCommand sends a command and waits for a specific ACK
 func sendCommand(cmd string) error {
 	_, err := conn.Write([]byte(cmd))
 	if err != nil {
@@ -71,13 +72,16 @@ func sendCommand(cmd string) error {
 	}
 
 	ackMsg := string(ackBuffer[:n])
-	expectedAck := "ACK:" + strings.Split(cmd, ":")[0]
+	// Determine expected ACK, handling commands with payloads
+	cmdParts := strings.Split(cmd, ":")
+	expectedAck := "ACK:" + cmdParts[0]
 	if ackMsg != expectedAck {
 		return fmt.Errorf("received invalid ACK for command '%s': got '%s', expected '%s'", cmd, ackMsg, expectedAck)
 	}
 	return nil
 }
 
+// sendFile handles the logic for transferring a single file with chunk acknowledgments
 func sendFile(filePath string, destPath string) error {
 	fmt.Printf("Sending file: %s\n", destPath)
 	// 1. Send FILE_START command
@@ -85,20 +89,25 @@ func sendFile(filePath string, destPath string) error {
 		return err
 	}
 
-	// 2. Send file data
-	fileData, err := os.ReadFile(filePath)
+	// 2. Send file data in chunks
+	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("error reading file '%s': %w", filePath, err)
+		return fmt.Errorf("error opening file '%s': %w", filePath, err)
 	}
+	defer file.Close()
 
-	for i := 0; i < len(fileData); i += CHUNK_SIZE {
-		end := i + CHUNK_SIZE
-		if end > len(fileData) {
-			end = len(fileData)
+	chunkBuffer := make([]byte, CHUNK_SIZE)
+	for {
+		n, err := file.Read(chunkBuffer)
+		if err != nil && err != os.ErrNotExist && err.Error() != "EOF" {
+			return fmt.Errorf("error reading chunk from file: %w", err)
 		}
-		chunk := fileData[i:end]
-		_, err := conn.Write(chunk)
-		if err != nil {
+		if n == 0 {
+			break
+		}
+
+		// Send the chunk and wait for ACK
+		if err := sendCommandWithData("CHUNK", chunkBuffer[:n]); err != nil {
 			return fmt.Errorf("error sending chunk: %w", err)
 		}
 	}
@@ -111,6 +120,29 @@ func sendFile(filePath string, destPath string) error {
 	return nil
 }
 
+// sendCommandWithData sends data and waits for a generic data ACK
+func sendCommandWithData(cmd string, data []byte) error {
+	_, err := conn.Write(data)
+	if err != nil {
+		return fmt.Errorf("error sending data for command '%s': %w", cmd, err)
+	}
+
+	ackBuffer := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(TIMEOUT))
+	n, err := conn.Read(ackBuffer)
+	if err != nil {
+		return fmt.Errorf("error receiving ACK for data command '%s': %w", cmd, err)
+	}
+
+	ackMsg := string(ackBuffer[:n])
+	expectedAck := "ACK:" + cmd
+	if ackMsg != expectedAck {
+		return fmt.Errorf("received invalid ACK for data command '%s': got '%s'", cmd, ackMsg)
+	}
+	return nil
+}
+
+// sendDirectory walks a directory and sends the structure and files to the server
 func sendDirectory(source string) error {
 	baseDir := filepath.Base(source)
 	fmt.Printf("Starting directory transfer: %s\n", baseDir)
@@ -121,7 +153,7 @@ func sendDirectory(source string) error {
 	}
 
 	// 2. Walk the directory and send files/subdirs
-	err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -130,7 +162,7 @@ func sendDirectory(source string) error {
 		if err != nil {
 			return err
 		}
-		// Skip the root directory itself as it's already created by DIR_TRANSFER_START
+		// Skip the root directory itself
 		if relPath == "." {
 			return nil
 		}
