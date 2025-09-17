@@ -54,7 +54,7 @@ func handleConnection(conn *net.UDPConn, remoteAddr *net.UDPAddr, initialData []
 
 	var currentDir string
 	var currentFile *os.File
-	var err error
+
 
 	defer func() {
 		if currentFile != nil {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,7 +12,7 @@ import (
 
 const (
 	SERVER_ADDR = "192.168.1.227:9000"
-	CHUNK_SIZE  = 4096 // Using a smaller chunk size for more reliable transmission
+	CHUNK_SIZE  = 4096
 	TIMEOUT     = 5 * time.Second
 )
 
@@ -43,14 +44,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Declare err variable to hold result of send functions
+	var sendErr error
 	if fileInfo.IsDir() {
-		err = sendDirectory(path)
+		sendErr = sendDirectory(path)
 	} else {
-		err = sendFile(path, filepath.Base(path))
+		sendErr = sendFile(path, filepath.Base(path))
 	}
 
-	if err != nil {
-		fmt.Printf("An error occurred: %v\n", err)
+	if sendErr != nil {
+		fmt.Printf("An error occurred: %v\n", sendErr)
 		os.Exit(1)
 	}
 
@@ -72,7 +75,6 @@ func sendCommand(cmd string) error {
 	}
 
 	ackMsg := string(ackBuffer[:n])
-	// Determine expected ACK, handling commands with payloads
 	cmdParts := strings.Split(cmd, ":")
 	expectedAck := "ACK:" + cmdParts[0]
 	if ackMsg != expectedAck {
@@ -84,12 +86,10 @@ func sendCommand(cmd string) error {
 // sendFile handles the logic for transferring a single file with chunk acknowledgments
 func sendFile(filePath string, destPath string) error {
 	fmt.Printf("Sending file: %s\n", destPath)
-	// 1. Send FILE_START command
 	if err := sendCommand(fmt.Sprintf("FILE_START:%s", destPath)); err != nil {
 		return err
 	}
 
-	// 2. Send file data in chunks
 	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("error opening file '%s': %w", filePath, err)
@@ -99,20 +99,21 @@ func sendFile(filePath string, destPath string) error {
 	chunkBuffer := make([]byte, CHUNK_SIZE)
 	for {
 		n, err := file.Read(chunkBuffer)
-		if err != nil && err != os.ErrNotExist && err.Error() != "EOF" {
+		if err != nil {
+			if err == io.EOF {
+				break // End of file
+			}
 			return fmt.Errorf("error reading chunk from file: %w", err)
 		}
 		if n == 0 {
 			break
 		}
 
-		// Send the chunk and wait for ACK
 		if err := sendCommandWithData("CHUNK", chunkBuffer[:n]); err != nil {
 			return fmt.Errorf("error sending chunk: %w", err)
 		}
 	}
 
-	// 3. Send FILE_END command
 	if err := sendCommand("FILE_END"); err != nil {
 		return err
 	}
@@ -147,12 +148,10 @@ func sendDirectory(source string) error {
 	baseDir := filepath.Base(source)
 	fmt.Printf("Starting directory transfer: %s\n", baseDir)
 
-	// 1. Send DIR_TRANSFER_START command
 	if err := sendCommand(fmt.Sprintf("DIR_TRANSFER_START:%s", baseDir)); err != nil {
 		return err
 	}
 
-	// 2. Walk the directory and send files/subdirs
 	err = filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -162,7 +161,6 @@ func sendDirectory(source string) error {
 		if err != nil {
 			return err
 		}
-		// Skip the root directory itself
 		if relPath == "." {
 			return nil
 		}
@@ -179,7 +177,6 @@ func sendDirectory(source string) error {
 		return fmt.Errorf("error walking directory: %w", err)
 	}
 
-	// 3. Send DIR_TRANSFER_END command
 	if err := sendCommand("DIR_TRANSFER_END"); err != nil {
 		return err
 	}
